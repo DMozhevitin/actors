@@ -1,23 +1,25 @@
 package actors
 
-import actors.types.{SearchRequestMessage, SearchRequestMessageWithResult, SearchResponseMessage}
-import akka.actor.{Actor, ActorRef, Props}
-import search.types.{SearchResult, SearchSystem}
+import actors.types._
+import akka.actor.{Actor, Props}
+import search.types.SearchSystem
 
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.collection.mutable
 import scala.concurrent.Future
+import scala.collection.mutable
 
 class MasterActor(searchSystems: List[SearchSystem]) extends Actor {
 
-  private var results: mutable.Buffer[SearchResult] = _
-  private val completed = mutable.Set[ActorRef]()
-  private var requester: ActorRef = _
+  def receive: Receive = receiveWithState(MasterActorState(mutable.Buffer(), Set(), None))
 
-  def receive: Receive = {
+  def receiveWithState(state: MasterActorState): Receive = {
     case SearchRequestMessageWithResult(query, count, timeout, result) =>
-      requester = sender
-      results = result
+      context become receiveWithState(
+        state.copy(
+          requester = Some(sender),
+          results = result
+        )
+      )
 
       searchSystems.zipWithIndex.foreach { case (ss, i) =>
         val child = context.actorOf(Props(classOf[ChildActor], ss), i.toString)
@@ -26,18 +28,28 @@ class MasterActor(searchSystems: List[SearchSystem]) extends Actor {
 
       Future {
         Thread.sleep(timeout)
-        requester.tell(SearchResponseMessage(results.toList), self)
+        respondWithSearchResult(state)
         context.stop(self)
       }
 
     case SearchResponseMessage(res) =>
-      results ++= res
-      completed += sender
+      state.results ++= res
+      context become receiveWithState(
+        state.copy(
+          completed = state.completed + sender
+        )
+      )
 
-      if (completed.size == searchSystems.size) {
-        requester.tell(SearchResponseMessage(results.toList), self)
-        context.stop(self)
+      if (state.completed.size == searchSystems.size) {
+        respondWithSearchResult(state)
       }
+  }
+
+  def respondWithSearchResult(state: MasterActorState): Unit = {
+    state.requester match {
+      case Some(r) => r.tell(SearchResponseMessage(state.results.toList), self)
+      case None => throw new IllegalStateException("Invalid actor state: receiver is None")
+    }
   }
 
 }
